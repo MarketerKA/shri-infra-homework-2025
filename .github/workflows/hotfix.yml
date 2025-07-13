@@ -1,0 +1,123 @@
+name: Hotfix
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: 'Release version to fix'
+        required: true
+        type: string
+
+env:
+  REGISTRY_ID: ${{ secrets.REGISTRY_ID }}
+  DOCKER_IMAGE: cr.yandex/${{ secrets.REGISTRY_ID }}/app
+
+jobs:
+  hotfix:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Checkout release branch
+      run: |
+        git fetch origin releases/${{ github.event.inputs.release_version }}
+        git checkout releases/${{ github.event.inputs.release_version }}
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+    
+    - name: Install dependencies
+      run: npm ci
+    
+    - name: Run linter
+      run: npm run lint
+    
+    - name: Run tests
+      run: npm test
+    
+    - name: Setup Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Login to Yandex Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: cr.yandex
+        username: ${{ secrets.YC_SERVICE_ACCOUNT_ID }}
+        password: ${{ secrets.YC_SERVICE_ACCOUNT_KEY }}
+    
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        push: true
+        tags: |
+          ${{ env.DOCKER_IMAGE }}:${{ github.event.inputs.release_version }}_fix${{ github.run_number }}
+          ${{ env.DOCKER_IMAGE }}:${{ github.event.inputs.release_version }}_latest
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+    
+    - name: Create hotfix tag
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        git tag v${{ github.event.inputs.release_version }}-fix${{ github.run_number }}
+        git push origin v${{ github.event.inputs.release_version }}-fix${{ github.run_number }}
+    
+    - name: Get commits since last tag
+      id: get-commits
+      run: |
+        # Получаем последний тег для этого релиза
+        LAST_TAG=$(git describe --tags --abbrev=0 --match="v${{ github.event.inputs.release_version }}*" 2>/dev/null | grep -v "fix${{ github.run_number }}" | head -1 || echo "")
+        if [ -z "$LAST_TAG" ]; then
+          COMMITS=$(git log --oneline --no-merges)
+        else
+          COMMITS=$(git log --oneline --no-merges ${LAST_TAG}..HEAD)
+        fi
+        echo "commits<<EOF" >> $GITHUB_OUTPUT
+        echo "$COMMITS" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+    
+    - name: Find and comment on Release Issue
+      uses: actions/github-script@v7
+      with:
+        script: |
+          // Ищем issue с релизом
+          const { data: issues } = await github.rest.issues.listForRepo({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            state: 'open',
+            labels: []
+          });
+          
+          const releaseIssue = issues.find(issue => 
+            issue.title.includes(`Release v${{ github.event.inputs.release_version }}`)
+          );
+          
+          if (releaseIssue) {
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: releaseIssue.number,
+              body: `## Hotfix Information
+          
+          **Date:** ${new Date().toISOString().split('T')[0]}
+          **Author:** ${context.actor}
+          **Fix Version:** ${{ github.event.inputs.release_version }}-fix${{ github.run_number }}
+          
+          ## Commits
+          \`\`\`
+          ${process.env.COMMITS || 'Hotfix commits'}
+          \`\`\`
+          
+          ## Docker Image
+          \`cr.yandex/${process.env.REGISTRY_ID}/app:${{ github.event.inputs.release_version }}_fix${{ github.run_number }}\``
+            });
+          }
+      env:
+        COMMITS: ${{ steps.get-commits.outputs.commits }} 

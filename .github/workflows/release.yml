@@ -1,0 +1,134 @@
+name: Release
+
+on:
+  workflow_dispatch:
+
+env:
+  REGISTRY_ID: ${{ secrets.REGISTRY_ID }}
+  DOCKER_IMAGE: cr.yandex/${{ secrets.REGISTRY_ID }}/app
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+    
+    - name: Install dependencies
+      run: npm ci
+    
+    - name: Run linter
+      run: npm run lint
+    
+    - name: Run tests
+      run: npm test
+    
+    - name: Setup Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Login to Yandex Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: cr.yandex
+        username: ${{ secrets.YC_SERVICE_ACCOUNT_ID }}
+        password: ${{ secrets.YC_SERVICE_ACCOUNT_KEY }}
+    
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        push: true
+        tags: |
+          ${{ env.DOCKER_IMAGE }}:${{ github.run_number }}
+          ${{ env.DOCKER_IMAGE }}:${{ github.run_number }}_latest
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+    
+    - name: Create release branch
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        git checkout -b releases/${{ github.run_number }}
+        git push origin releases/${{ github.run_number }}
+    
+    - name: Create tag
+      run: |
+        git tag v${{ github.run_number }}
+        git push origin v${{ github.run_number }}
+    
+    - name: Get commits since last release
+      id: get-commits
+      run: |
+        # Получаем последний релизный тег
+        LAST_TAG=$(git describe --tags --abbrev=0 --match="v*" 2>/dev/null || echo "")
+        if [ -z "$LAST_TAG" ]; then
+          COMMITS=$(git log --oneline --no-merges)
+        else
+          COMMITS=$(git log --oneline --no-merges ${LAST_TAG}..HEAD)
+        fi
+        echo "commits<<EOF" >> $GITHUB_OUTPUT
+        echo "$COMMITS" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+    
+    - name: Create Release Issue
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const { data: issue } = await github.rest.issues.create({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            title: `Release v${context.runNumber}`,
+            body: `## Release Information
+          
+          **Date:** ${new Date().toISOString().split('T')[0]}
+          **Author:** ${context.actor}
+          **Version:** ${context.runNumber}
+          
+          ## Commits
+          \`\`\`
+          ${process.env.COMMITS || 'Initial release'}
+          \`\`\`
+          
+          ## Docker Image
+          \`cr.yandex/${process.env.REGISTRY_ID}/app:${context.runNumber}\`
+          
+          ## Release Branch
+          \`releases/${context.runNumber}\``
+          });
+          
+          console.log(`Created issue: ${issue.html_url}`);
+      env:
+        COMMITS: ${{ steps.get-commits.outputs.commits }}
+    
+    - name: Update CHANGELOG
+      run: |
+        # Создаем временный файл с новым содержимым
+        cat > temp_changelog.md << EOF
+        # v${{ github.run_number }}
+        
+        ${{ steps.get-commits.outputs.commits }}
+        
+        ---
+        
+        EOF
+        
+        # Добавляем содержимое существующего CHANGELOG.md
+        if [ -f CHANGELOG.md ]; then
+          cat CHANGELOG.md >> temp_changelog.md
+        fi
+        
+        # Заменяем оригинальный файл
+        mv temp_changelog.md CHANGELOG.md
+        
+        # Коммитим изменения
+        git add CHANGELOG.md
+        git commit -m "Update CHANGELOG for v${{ github.run_number }}"
+        git push origin releases/${{ github.run_number }} 
